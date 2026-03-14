@@ -10,6 +10,80 @@ the **bleak** library.
 
 ---
 
+## PWA or Native App?
+
+**Short answer: PWA is the right choice here, and it works exactly like a
+native app.**
+
+### Why PWA works perfectly
+
+The dashboard uses **Python + bleak** on the backend, which accesses the
+native OS Bluetooth stack (BlueZ on Linux, WinRT on Windows, CoreBluetooth
+on macOS). The browser is just the UI layer. This means:
+
+| Concern | Reality |
+|---|---|
+| BLE access | ✅ Full native OS Bluetooth via `bleak` – no browser limitations |
+| iOS / Android | ✅ Works in any browser that can reach the Python server |
+| Offline shell | ✅ Service Worker caches the app so it loads instantly |
+| Home screen icon | ✅ Chrome / Edge / Safari prompt to install |
+| Full-screen mode | ✅ `display: standalone` removes all browser chrome |
+| Background BLE | ✅ Python server keeps running; UI reconnects via SSE |
+| Push notifications | ⚠️ Requires HTTPS for Web Push – use OS notifications instead |
+
+### Native app packaging (optional)
+
+If you want a self-contained binary with no separate Python server step,
+you can package the Python server with the dashboard as a desktop app:
+
+```bash
+# Electron-like packaging with Tauri (requires Rust) or PyInstaller
+pip install pyinstaller
+pyinstaller --onefile --add-data "examples/dashboard:examples/dashboard" \
+            examples/dashboard/main.py
+```
+
+Or use the existing **Kivy Android APK** in `examples/kivy/` for a true
+mobile native app.
+
+### Why NOT pure Web Bluetooth PWA
+
+A fully browser-based PWA using the [Web Bluetooth API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API)
+would require:
+- Chrome / Edge only (no Firefox, no iOS Safari)
+- HTTPS (not just localhost)
+- User gesture for every scan
+- Limited service UUID filtering
+
+The Python-backend approach has **no such restrictions**.
+
+---
+
+## Installing the PWA
+
+### Desktop (Chrome / Edge)
+
+1. Start the server: `python -m examples.dashboard`
+2. Open `http://127.0.0.1:8765` in Chrome or Edge
+3. Click the **📲 Install App** button in the top bar  
+   *(or use the browser's address-bar install icon)*
+4. The dashboard opens as a standalone window — no browser chrome
+
+### Android (Chrome)
+
+1. Run the server on the same machine or local network with `--host 0.0.0.0`
+2. Open `http://<your-ip>:8765` in Chrome on Android
+3. Chrome shows "Add to Home Screen" — tap it
+4. The app appears on your home screen with the BLE icon
+
+### iOS (Safari)
+
+1. Open the URL in Safari
+2. Tap **Share → Add to Home Screen**
+3. The app opens full-screen using the meta tags already in the HTML
+
+---
+
 ## Features
 
 | Area | What it does |
@@ -21,6 +95,7 @@ the **bleak** library.
 | **GATT explorer** | Full service/characteristic tree with Read / Write / Notify buttons |
 | **Actions panel** | Lock, Unlock, Get Status/Battery/Speed/Serial, custom Read/Write/Subscribe |
 | **Event log** | Real-time BLE events (scan, connect, disconnect, notify, errors) via SSE |
+| **PWA** | Installable, offline shell, home screen icon, standalone mode |
 
 ---
 
@@ -32,7 +107,7 @@ examples/dashboard/
 ├── main.py               ← Entry point (argparse, asyncio.run)
 ├── ble_manager.py        ← Core BLE logic (wraps bleak)
 ├── scooter_protocol.py   ← Ninebot protocol UUIDs + parsers
-├── server.py             ← aiohttp HTTP + SSE server + embedded HTML
+├── server.py             ← aiohttp HTTP + SSE server + embedded HTML + PWA assets
 └── requirements.txt
 ```
 
@@ -44,11 +119,13 @@ examples/dashboard/
   live updates.
 * **Server-Sent Events** push BLE events to the browser in real time — no
   polling, no WebSocket library needed.
+* **PWA assets** (`/manifest.json`, `/sw.js`, `/icon-192.png`, `/icon-512.png`)
+  are generated and served by the Python server — no static files needed.
+* **Service Worker** caches the app shell for instant offline load and uses
+  network-first for all API / SSE calls (real-time BLE data is never cached).
 * The **HTML dashboard** is embedded in `server.py` as a string constant so
   the entire dashboard is a single Python package with zero static-file
   dependencies.
-* All dashboard actions (scan, connect, commands) call the REST API; the
-  results come back asynchronously via the SSE stream.
 
 ---
 
@@ -74,7 +151,7 @@ From the repository root:
 # Simplest – opens browser automatically
 python -m examples.dashboard
 
-# Custom host/port
+# Expose on local network (for Android PWA install)
 python -m examples.dashboard --host 0.0.0.0 --port 9000
 
 # No browser auto-open
@@ -93,6 +170,10 @@ Then open **http://127.0.0.1:8765** in your browser.
 | Method | Path | Body | Description |
 |---|---|---|---|
 | GET | `/` | – | Dashboard HTML |
+| GET | `/manifest.json` | – | Web App Manifest |
+| GET | `/sw.js` | – | Service Worker |
+| GET | `/icon-192.png` | – | 192×192 PNG icon |
+| GET | `/icon-512.png` | – | 512×512 PNG icon |
 | GET | `/api/status` | – | Full status JSON |
 | GET | `/api/devices` | – | Discovered devices |
 | GET | `/api/services` | – | GATT services of connected device |
@@ -131,6 +212,10 @@ Responses arrive as `notify` events in the SSE stream.
 
 - [ ] Open browser at `http://127.0.0.1:8765`
 - [ ] SSE indicator turns green (top-right)
+- [ ] Event log shows "PWA service worker ready"
+- [ ] Event log shows "App is installable – click 📲 Install App"
+- [ ] Click **📲 Install App** → browser install dialog appears
+- [ ] After install, app opens in its own standalone window (no browser chrome)
 - [ ] Click **Scan** → device list populates with real BLE devices
 - [ ] Click a device → connect dialog triggers
 - [ ] Status indicator turns green (Connected)
@@ -140,5 +225,6 @@ Responses arrive as `notify` events in the SSE stream.
 - [ ] Click **N** (Notify) on a notifying characteristic → live values in log
 - [ ] Click **🔒 Lock** / **🔓 Unlock** (Ninebot only) → command sent, response in log
 - [ ] Click **✕ Disconnect** → status returns to Disconnected
-- [ ] Close browser tab and reconnect → SSE re-establishes automatically
-- [ ] Event log scrolls and **Clear** button works
+- [ ] Stop the Python server, reload the PWA → cached shell loads (offline mode)
+- [ ] Restart Python server, reload → SSE reconnects, live data resumes
+- [ ] Open `http://127.0.0.1:8765/?action=scan` → scan starts automatically

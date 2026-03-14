@@ -41,6 +41,147 @@ logger = logging.getLogger(__name__)
 DASHBOARD_VERSION = "1.0"
 
 # ---------------------------------------------------------------------------
+# PWA assets
+# ---------------------------------------------------------------------------
+
+_MANIFEST_JSON = json.dumps({
+    "name": "BLE Dashboard",
+    "short_name": "BLE",
+    "description": "BLE device scanner and controller powered by bleak",
+    "start_url": "/",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#0a0e1a",
+    "theme_color": "#0a0e1a",
+    "lang": "en",
+    "categories": ["utilities", "tools"],
+    "icons": [
+        {
+            "src": "/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any maskable",
+        },
+        {
+            "src": "/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any maskable",
+        },
+    ],
+    "shortcuts": [
+        {
+            "name": "Start Scan",
+            "short_name": "Scan",
+            "description": "Start a BLE device scan immediately",
+            "url": "/?action=scan",
+            "icons": [{"src": "/icon-192.png", "sizes": "192x192"}],
+        }
+    ],
+})
+
+_SERVICE_WORKER_JS = f"""\
+/* BLE Dashboard Service Worker – v{DASHBOARD_VERSION} */
+const CACHE = 'ble-dashboard-v{DASHBOARD_VERSION}';
+const SHELL = ['/', '/manifest.json', '/icon-192.png', '/icon-512.png'];
+
+self.addEventListener('install', e => {{
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  self.skipWaiting();
+}});
+
+self.addEventListener('activate', e => {{
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+}});
+
+self.addEventListener('fetch', e => {{
+  const url = new URL(e.request.url);
+  // API calls and SSE stream: always go to network (real-time BLE data)
+  if (url.pathname.startsWith('/api/') || url.pathname === '/events' ||
+      url.pathname === '/sw.js') {{
+    e.respondWith(
+      fetch(e.request).catch(() =>
+        new Response(JSON.stringify({{error: 'Server offline – start the Python server'}}),
+          {{status: 503, headers: {{'Content-Type': 'application/json'}}}})
+      )
+    );
+    return;
+  }}
+  // App shell: stale-while-revalidate
+  e.respondWith(
+    caches.open(CACHE).then(cache =>
+      cache.match(e.request).then(cached => {{
+        const fetched = fetch(e.request).then(resp => {{
+          if (resp.ok) cache.put(e.request, resp.clone());
+          return resp;
+        }}).catch(() => null);
+        return cached || fetched;
+      }})
+    )
+  );
+}});
+"""
+
+
+def _make_icon_png(size: int) -> bytes:
+    """
+    Generate a PNG app icon at runtime using only the Python standard library.
+
+    Design: dark navy background (#0a0e1a) with a concentric two-tone circle
+    in accent blue (#4f8ef7) and cyan (#00d4ff) – evokes a Bluetooth signal.
+    """
+    import math
+    import struct
+    import zlib
+
+    bg     = (10,  14,  26)   # #0a0e1a
+    ring   = (79,  142, 247)  # #4f8ef7
+    inner  = (0,   212, 255)  # #00d4ff
+
+    cx = cy   = size / 2.0
+    outer_r   = size * 0.42
+    inner_r   = size * 0.22
+
+    rows: list[bytes] = []
+    for y in range(size):
+        row = bytearray([0])  # PNG filter byte: None
+        for x in range(size):
+            d = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+            if d <= inner_r:
+                row.extend(inner)
+            elif d <= outer_r:
+                row.extend(ring)
+            else:
+                row.extend(bg)
+        rows.append(bytes(row))
+
+    raw = b"".join(rows)
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        body = ctype + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    sig  = b"\x89PNG\r\n\x1a\n"
+    ihdr = _chunk(b"IHDR", struct.pack(">II", size, size) + bytes([8, 2, 0, 0, 0]))
+    idat = _chunk(b"IDAT", zlib.compress(raw, 6))
+    iend = _chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+# Pre-generate icons once at module load time to avoid per-request overhead
+_ICON_192 = _make_icon_png(192)
+_ICON_512 = _make_icon_png(512)
+
+# ---------------------------------------------------------------------------
 # Embedded dashboard HTML
 # ---------------------------------------------------------------------------
 
@@ -48,7 +189,14 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0a0e1a" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="BLE Dashboard" />
+<link rel="manifest" href="/manifest.json" />
+<link rel="apple-touch-icon" href="/icon-192.png" />
 <title>BLE Dashboard</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -77,6 +225,12 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
     font-size: 14px;
     line-height: 1.5;
+  }
+
+  /* PWA standalone: extra top padding to avoid status-bar overlap on iOS */
+  @media (display-mode: standalone) {
+    .header { padding-top: env(safe-area-inset-top, 0px); }
+    .app    { grid-template-rows: calc(56px + env(safe-area-inset-top, 0px)) 1fr; }
   }
 
   /* ── Layout ─────────────────────────────── */
@@ -402,6 +556,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span id="connectedDeviceName" class="text-muted text-sm"></span>
     </div>
     <div class="header-spacer"></div>
+    <button id="btnInstall" class="btn btn-primary btn-sm"
+      style="display:none;" onclick="doInstall()" title="Install as app">
+      📲 Install App
+    </button>
     <span class="header-version text-muted text-sm">bleak dashboard v1.0</span>
     <span id="sseStatus" class="badge badge-muted">● SSE</span>
   </header>
@@ -970,6 +1128,61 @@ function shortUuid(uuid) {
   return uuid.substring(0, 8) + '…';
 }
 
+// ── PWA – Service Worker registration ─────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', async () => {
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js', {scope: '/'});
+      reg.addEventListener('updatefound', () => {
+        addLog('state', 'PWA update available – reload to apply');
+      });
+      addLog('state', 'PWA service worker ready');
+    } catch (err) {
+      // SW may fail in non-secure contexts (non-localhost) – that's OK
+      console.warn('Service worker registration failed:', err);
+    }
+  });
+}
+
+// ── PWA – Install prompt ───────────────────────────────────────────────────
+let _installPrompt = null;
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  _installPrompt = e;
+  const btn = document.getElementById('btnInstall');
+  if (btn) {
+    btn.style.display = '';
+    addLog('state', 'App is installable – click "📲 Install App" to add to your home screen');
+  }
+});
+
+window.addEventListener('appinstalled', () => {
+  _installPrompt = null;
+  const btn = document.getElementById('btnInstall');
+  if (btn) btn.style.display = 'none';
+  addLog('state', '✅ App installed successfully!');
+});
+
+async function doInstall() {
+  if (!_installPrompt) return;
+  _installPrompt.prompt();
+  const { outcome } = await _installPrompt.userChoice;
+  addLog('state', `Install ${outcome === 'accepted' ? 'accepted ✅' : 'dismissed'}`);
+  _installPrompt = null;
+  document.getElementById('btnInstall').style.display = 'none';
+}
+
+// ── Handle URL shortcuts (e.g. ?action=scan) ─────────────────────────────
+(function () {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('action') === 'scan') {
+    // Delay lets the SSE connection and initial status refresh complete first
+    // so scan events are displayed correctly from the moment they arrive.
+    window.addEventListener('load', () => setTimeout(doScan, 1200));
+  }
+})();
+
 // ── Init ───────────────────────────────────────────────────────────────────
 connectSSE();
 refreshStatus();
@@ -1022,8 +1235,15 @@ class DashboardServer:
 
     def _build_app(self) -> web.Application:
         app = web.Application()
+        # PWA assets
+        app.router.add_get("/manifest.json", self._handle_manifest)
+        app.router.add_get("/sw.js", self._handle_sw)
+        app.router.add_get("/icon-192.png", self._handle_icon_192)
+        app.router.add_get("/icon-512.png", self._handle_icon_512)
+        # Dashboard + SSE
         app.router.add_get("/", self._handle_index)
         app.router.add_get("/events", self._handle_sse)
+        # REST API
         app.router.add_get("/api/status", self._handle_status)
         app.router.add_get("/api/devices", self._handle_devices)
         app.router.add_get("/api/services", self._handle_services)
@@ -1040,6 +1260,35 @@ class DashboardServer:
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
+
+    async def _handle_manifest(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            text=_MANIFEST_JSON,
+            content_type="application/manifest+json",
+            charset="utf-8",
+        )
+
+    async def _handle_sw(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            text=_SERVICE_WORKER_JS,
+            content_type="application/javascript",
+            charset="utf-8",
+            headers={"Service-Worker-Allowed": "/"},
+        )
+
+    async def _handle_icon_192(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            body=_ICON_192,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    async def _handle_icon_512(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            body=_ICON_512,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     async def _handle_index(self, _req: web.Request) -> web.Response:
         html = _DASHBOARD_HTML.replace(
