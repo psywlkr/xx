@@ -83,6 +83,7 @@ Contents:
 
    installation
    usage
+   project_report_de
    api/index
    backends/index
    troubleshooting
