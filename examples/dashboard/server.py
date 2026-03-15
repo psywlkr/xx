@@ -900,6 +900,22 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+
+      <!-- Debug panel -->
+      <div class="panel" id="debugPanel">
+        <div class="panel-header" style="display:flex;justify-content:space-between;cursor:pointer;" onclick="toggleDebug()">
+          <span style="display:flex;align-items:center;gap:8px;">
+            <span class="dot" style="background:var(--muted)"></span>Debug
+          </span>
+          <span id="debugToggleLabel" class="badge badge-muted">▶ Show</span>
+        </div>
+        <div class="panel-body" id="debugPanelBody" style="display:none;font-family:monospace;font-size:12px;">
+          <div style="margin-bottom:8px;color:var(--muted);">Active notify subscriptions</div>
+          <div id="debugNotifyList" style="margin-bottom:12px;color:var(--accent2);">–</div>
+          <div style="margin-bottom:8px;color:var(--muted);">Last 20 raw frames</div>
+          <div id="debugRawFrames" style="max-height:220px;overflow-y:auto;"></div>
+        </div>
+      </div>
     </main>
 
     <!-- ── Right panel (event log) ────────────── -->
@@ -946,10 +962,57 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 let state = {
   status: 'disconnected',
   isConnected: false,
+  hasLiveData: false,       // true once first notify frame has arrived
   connectedDevice: null,
   devices: {},
   selectedAddress: null,
+  activeNotifies: new Set(), // UUIDs with active notify subscriptions
 };
+
+// ── Protocol constants ──────────────────────────────────────────────────────
+const NINEBOT_TX_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const NINEBOT_RX_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+// 36V Li-Ion battery voltage → percent lookup table
+// Interpolated linearly between breakpoints; outside range clamped.
+const _VOLT_TABLE = [
+  [42.0, 100], [40.0, 85], [38.5, 65], [37.0, 45],
+  [35.8, 28],  [34.5, 10], [33.0, 0],
+];
+
+function voltageToPercent(v) {
+  if (v == null) return null;  // intentional: catches both null and undefined
+  if (v >= _VOLT_TABLE[0][0]) return 100;
+  if (v <= _VOLT_TABLE[_VOLT_TABLE.length - 1][0]) return 0;
+  for (let i = 0; i < _VOLT_TABLE.length - 1; i++) {
+    const [v1, p1] = _VOLT_TABLE[i];
+    const [v2, p2] = _VOLT_TABLE[i + 1];
+    if (v <= v1 && v >= v2) {
+      return Math.round(p2 + (v - v2) / (v1 - v2) * (p1 - p2));
+    }
+  }
+  return null;
+}
+
+// Parse a Ninebot UART response packet.
+// Returns null if header or length is invalid.
+function parseNinebotFrame(bytes) {
+  if (!bytes || bytes.length < 6) return null;
+  if (bytes[0] !== 0x55 || bytes[1] !== 0xAA) return null;
+  const pktLen = bytes[2];
+  const addr   = bytes[3];
+  const mode   = bytes[4];
+  const cmd    = bytes[5];
+  const payloadEnd = 6 + pktLen - 2;
+  if (bytes.length < payloadEnd) return null;
+  const payload = bytes.slice(6, payloadEnd);
+  return { pktLen, addr, mode, cmd, payload };
+}
+
+// Debug panel state
+let _debugOpen = false;
+const _MAX_RAW_FRAMES = 20;
+let _rawFrames = [];   // ring buffer of {ts, uuid, hex, decoded}
 
 // ── SSE connection ─────────────────────────────────────────────────────────
 let evtSource = null;
@@ -1005,6 +1068,14 @@ function handleEvent(evt) {
       break;
     case 'data':
       if (evt.data && evt.data.services) renderServices(evt.data.services);
+      // Track notify subscribe confirmations (message contains "Subscribed to notifications on <uuid>")
+      {
+        const m = evt.message && evt.message.match(/Subscribed to notifications on ([0-9a-f-]+)/i);
+        if (m) {
+          state.activeNotifies.add(m[1]);
+          if (_debugOpen) _refreshDebugPanel();
+        }
+      }
       break;
     case 'notify':
       if (evt.data) updateTelemetryFromNotify(evt.data);
@@ -1013,11 +1084,91 @@ function handleEvent(evt) {
 }
 
 // ── Telemetry helpers ──────────────────────────────────────────────────────
+
 function updateTelemetryFromNotify(data) {
-  // For standard Battery Level characteristic
-  if (data.uuid && data.uuid.toLowerCase().includes('2a19') && data.data.length >= 1) {
-    updateMetricCard('battery', data.data[0], '%');
+  if (!data || !data.uuid) return;
+  const uuid = data.uuid.toLowerCase();
+  const bytes = data.data || [];
+  const hex   = data.hex || bytes.map(b => b.toString(16).padStart(2,'0')).join('');
+
+  // Track first live-data arrival → update status label
+  if (!state.hasLiveData) {
+    state.hasLiveData = true;
+    _refreshStatusText();
   }
+
+  // Track active notify subscriptions for debug panel
+  state.activeNotifies.add(data.uuid);
+
+  // ── Standard Battery Level (0x2A19)
+  if (uuid.includes('2a19') && bytes.length >= 1) {
+    const pct = Math.min(100, Math.max(0, bytes[0]));
+    updateMetricCard('battery', pct, '%');
+    _addDebugFrame(data.uuid, hex, `Battery Level: ${pct}%`);
+    return;
+  }
+
+  // ── Ninebot TX (6e400003): proprietary UART responses
+  if (uuid === NINEBOT_TX_UUID) {
+    const frame = parseNinebotFrame(bytes);
+    let decoded = '(unknown frame)';
+
+    if (frame) {
+      const { cmd, payload } = frame;
+
+      // Speed response (cmd 0x25)
+      if (cmd === 0x25 && payload.length >= 2) {
+        const raw = (payload[1] << 8) | payload[0];  // little-endian uint16
+        const spd = (raw / 10).toFixed(1);
+        if (raw >= 0 && raw <= 2000) {  // plausibility: 0–200 km/h
+          updateMetricCard('speed', spd, 'km/h');
+          decoded = `Speed: ${spd} km/h`;
+        } else {
+          decoded = `Speed: implausible raw=${raw}`;
+        }
+      }
+
+      // Battery info response (cmd 0x22)
+      else if (cmd === 0x22 && payload.length >= 2) {
+        const rawVolts = ((payload[1] << 8) | payload[0]);
+        const voltage  = rawVolts / 100;
+        if (voltage >= 20 && voltage <= 55) {  // plausible 36V pack range
+          const pct = voltageToPercent(voltage);
+          updateMetricCard('battery', pct, '%');
+          decoded = `Battery: ${voltage.toFixed(2)}V → ${pct}%`;
+        } else {
+          decoded = `Battery: implausible raw=${rawVolts}`;
+        }
+      }
+
+      // Status response (cmd 0x00 / addr 0x64) – lock + temperature
+      else if (cmd === 0x00 && payload.length >= 6) {
+        const rawTemp  = (payload[5] << 8) | payload[4];
+        const tempC    = (rawTemp / 10).toFixed(1);
+        const lockByte = payload[0];
+        // rawTemp < 1000 corresponds to tempC < 100 °C (raw unit = 0.1 °C)
+        if (rawTemp >= 0 && rawTemp < 1000) {
+          updateMetricCard('temp', tempC, '°C');
+        }
+        const lockText = lockByte === 1 ? '🔒 Locked' : lockByte === 0 ? '🔓 Unlocked' : '–';
+        updateMetricCard('lock', lockText, '');
+        decoded = `Status: lock=${lockByte} temp=${tempC}°C`;
+      }
+
+      // Fallback for other recognised headers
+      else {
+        decoded = `Ninebot cmd=0x${cmd.toString(16)} len=${payload.length}`;
+      }
+    }
+
+    addLog('notify', `RX ${hex.substring(0,20)}${hex.length>20?'…':''} → ${decoded}`);
+    _addDebugFrame(data.uuid, hex, decoded);
+    return;
+  }
+
+  // ── Unknown characteristic – log raw hex so user can analyse it
+  addLog('notify', `[${data.uuid.substring(0,8)}…] RAW: ${hex}`);
+  _addDebugFrame(data.uuid, hex, '(no decoder)');
 }
 
 function updateMetricCard(id, value, unit) {
@@ -1026,12 +1177,59 @@ function updateMetricCard(id, value, unit) {
 }
 
 function clearTelemetry() {
+  state.hasLiveData = false;
+  state.activeNotifies.clear();
+  _rawFrames = [];
   ['battery','speed','rssi','temp','lock','mtu'].forEach(id => {
     const el = document.getElementById('val-' + id);
     if (el) el.textContent = '–';
   });
   document.getElementById('deviceInfoPanel').style.display = 'none';
   renderServices([]);
+  _refreshDebugPanel();
+}
+
+// ── Debug panel ─────────────────────────────────────────────────────────────
+
+function toggleDebug() {
+  _debugOpen = !_debugOpen;
+  const body  = document.getElementById('debugPanelBody');
+  const label = document.getElementById('debugToggleLabel');
+  if (body)  body.style.display  = _debugOpen ? '' : 'none';
+  if (label) label.textContent   = _debugOpen ? '▼ Hide' : '▶ Show';
+  if (_debugOpen) _refreshDebugPanel();
+}
+
+function _addDebugFrame(uuid, hex, decoded) {
+  const now = new Date();
+  const ts  = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  _rawFrames.push({ ts, uuid, hex, decoded });
+  if (_rawFrames.length > _MAX_RAW_FRAMES) _rawFrames.shift();
+  if (_debugOpen) _refreshDebugPanel();
+}
+
+function _refreshDebugPanel() {
+  const notifyEl = document.getElementById('debugNotifyList');
+  const framesEl = document.getElementById('debugRawFrames');
+  if (!notifyEl || !framesEl) return;
+
+  // Active notify UUIDs
+  const uuids = [...state.activeNotifies];
+  notifyEl.innerHTML = uuids.length
+    ? uuids.map(u => `<div style="margin-bottom:2px;color:var(--accent2);">● ${escHtml(u)}</div>`).join('')
+    : '<div style="color:var(--muted);">No active notify subscriptions</div>';
+
+  // Raw frames (newest last)
+  framesEl.innerHTML = _rawFrames.length
+    ? _rawFrames.map(f => `
+        <div style="border-bottom:1px solid var(--border);padding:4px 0;">
+          <span style="color:var(--muted);">${escHtml(f.ts)}</span>
+          <span style="color:var(--accent);margin-left:6px;">${escHtml(f.uuid.substring(0,8))}…</span><br/>
+          <span style="color:#e2e8f0;word-break:break-all;">${escHtml(f.hex)}</span><br/>
+          <span style="color:var(--accent2);">${escHtml(f.decoded)}</span>
+        </div>`).join('')
+    : '<div style="color:var(--muted);">No frames yet</div>';
+  framesEl.scrollTop = framesEl.scrollHeight;
 }
 
 // ── Connection state UI ────────────────────────────────────────────────────
@@ -1041,13 +1239,33 @@ const stateColors = {
   disconnecting: '#f59e0b', error: '#ef4444'
 };
 
+const _STATE_LABELS = {
+  disconnected:  'Not connected',
+  scanning:      'Scanning…',
+  connecting:    'Connecting…',
+  disconnecting: 'Disconnecting…',
+  error:         'Connection error',
+};
+
+function _refreshStatusText() {
+  const text = document.getElementById('statusText');
+  if (!text) return;
+  if (state.status === 'connected') {
+    text.textContent = state.hasLiveData
+      ? 'Connected – Live data active'
+      : 'Connected – waiting for data';
+  } else {
+    text.textContent = _STATE_LABELS[state.status]
+      || (state.status.charAt(0).toUpperCase() + state.status.slice(1));
+  }
+}
+
 function updateConnectionState(s, isConnected) {
   state.status = s;
   state.isConnected = isConnected;
   const dot = document.getElementById('statusDot');
-  const text = document.getElementById('statusText');
   dot.className = 'status-indicator state-' + s;
-  text.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+  _refreshStatusText();
 
   if (!isConnected) {
     state.connectedDevice = null;
