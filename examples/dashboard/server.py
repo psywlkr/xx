@@ -83,7 +83,8 @@ _MANIFEST_JSON = json.dumps({
 _SERVICE_WORKER_JS = f"""\
 /* BLE Dashboard Service Worker – v{DASHBOARD_VERSION} */
 const CACHE = 'ble-dashboard-v{DASHBOARD_VERSION}';
-const SHELL = ['/', '/manifest.json', '/icon-192.png', '/icon-512.png'];
+/* App shell – cached at install so the dashboard loads instantly on every visit */
+const SHELL = ['/', '/manifest.json', '/icon-192.png', '/icon-512.png', '/offline.html'];
 
 self.addEventListener('install', e => {{
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
@@ -112,14 +113,15 @@ self.addEventListener('fetch', e => {{
     );
     return;
   }}
-  // App shell: stale-while-revalidate
+  // App shell: stale-while-revalidate; fall back to offline page on failure
+  const isNav = e.request.mode === 'navigate';
   e.respondWith(
     caches.open(CACHE).then(cache =>
       cache.match(e.request).then(cached => {{
         const fetched = fetch(e.request).then(resp => {{
           if (resp.ok) cache.put(e.request, resp.clone());
           return resp;
-        }}).catch(() => null);
+        }}).catch(() => isNav ? caches.match('/offline.html') : null);
         return cached || fetched;
       }})
     )
@@ -181,6 +183,40 @@ def _make_icon_png(size: int) -> bytes:
 _ICON_192 = _make_icon_png(192)
 _ICON_512 = _make_icon_png(512)
 
+_OFFLINE_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<title>BLE Dashboard &ndash; Offline</title>
+<style>
+  html,body{margin:0;height:100vh;background:#0a0e1a;color:#e2e8f0;
+    font-family:'Inter','Segoe UI',system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center;text-align:center;}
+  h2{color:#4f8ef7;font-size:20px;margin:0 0 12px;}
+  p{color:#64748b;font-size:14px;line-height:1.6;margin:0 0 20px;}
+  code{display:inline-block;background:#12172b;padding:6px 14px;border-radius:6px;
+    font-size:13px;color:#00d4ff;margin-top:4px;}
+  button{background:#4f8ef7;color:#fff;border:none;padding:12px 28px;border-radius:8px;
+    font-size:14px;font-weight:600;cursor:pointer;}
+  button:active{background:#3b7de8;}
+</style>
+</head>
+<body>
+<div>
+  <div style="font-size:64px;margin-bottom:16px">📡</div>
+  <h2>Server Offline</h2>
+  <p>The BLE Dashboard Python server is not running.</p>
+  <p>Start it with:<br/><code>python -m examples.dashboard</code></p>
+  <br/>
+  <button onclick="location.reload()">&#x21BB; Retry</button>
+</div>
+</body>
+</html>
+"""
+
 # ---------------------------------------------------------------------------
 # Embedded dashboard HTML
 # ---------------------------------------------------------------------------
@@ -238,6 +274,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: grid;
     grid-template-rows: 56px 1fr;
     height: 100vh;
+    height: 100dvh; /* dynamic viewport height – avoids mobile browser-chrome overlap */
   }
 
   .header {
@@ -543,6 +580,83 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .items-center { align-items: center; }
   .justify-between { justify-content: space-between; }
   .font-mono { font-family: monospace; }
+
+  /* ── Mobile-responsive layout ──────────────────────────────── */
+  /* Tab bar: hidden on desktop, shown on mobile */
+  .mobile-tabs { display: none; }
+
+  @media (max-width: 900px) {
+    /* Header: compact */
+    .header { padding: 0 12px; gap: 8px; }
+    .header-version { display: none; }
+
+    /* App grid gets a third row for the tab bar */
+    .app { grid-template-rows: 48px 1fr 56px; }
+
+    /* Collapse 3-column grid to 1 column */
+    .main { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+
+    /* All panels overlap in the same grid cell; only the active one shows */
+    .sidebar, .center, .rightpanel {
+      grid-column: 1 / -1;
+      grid-row: 1;
+      display: none;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      border: none;
+    }
+    .sidebar.tab-active   { display: flex; flex-direction: column; }
+    .center.tab-active    { display: block; }
+    .rightpanel.tab-active { display: flex; flex-direction: column; }
+
+    /* Show the tab bar */
+    .mobile-tabs {
+      display: flex;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+    }
+    .mobile-tab {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      border: none;
+      background: none;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      padding: 6px 4px;
+      transition: color .15s;
+      position: relative;
+    }
+    .mobile-tab .tab-icon { font-size: 22px; line-height: 1; }
+    .mobile-tab.active { color: var(--accent); }
+
+    /* Unread badge on Log tab */
+    .tab-badge {
+      position: absolute;
+      top: 4px;
+      right: calc(50% - 20px);
+      background: var(--error);
+      color: #fff;
+      border-radius: 9px;
+      font-size: 10px;
+      font-weight: 700;
+      min-width: 16px;
+      height: 16px;
+      line-height: 16px;
+      text-align: center;
+      padding: 0 4px;
+      display: none;
+    }
+    .tab-badge.visible { display: block; }
+
+    /* Telemetry cards: always 2-up on mobile */
+    .cards-grid { grid-template-columns: 1fr 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -567,7 +681,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- ── Main ───────────────────────────────── -->
   <div class="main">
     <!-- ── Sidebar ──────────────────────────── -->
-    <aside class="sidebar">
+    <aside class="sidebar tab-active" id="panelDevices">
       <!-- Scan controls -->
       <div class="sidebar-section">
         <div class="sidebar-section-header">Scan &amp; Connect</div>
@@ -603,7 +717,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </aside>
 
     <!-- ── Center ────────────────────────────── -->
-    <main class="center">
+    <main class="center" id="panelDashboard">
       <!-- Telemetry cards -->
       <div class="panel">
         <div class="panel-header"><span class="dot" style="background:var(--accent2)"></span>Live Telemetry</div>
@@ -716,7 +830,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </main>
 
     <!-- ── Right panel (event log) ────────────── -->
-    <aside class="rightpanel">
+    <aside class="rightpanel" id="panelLog">
       <div class="panel-header flex items-center justify-between" style="display:flex;justify-content:space-between;padding:12px 16px;">
         <span style="display:flex;align-items:center;gap:8px;">
           <span class="dot" style="background:var(--accent)"></span>Event Log
@@ -732,6 +846,26 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </aside>
   </div>
+
+  <!-- ── Mobile tab bar ─────────────────────────────── -->
+  <nav class="mobile-tabs" role="tablist" aria-label="Navigation">
+    <button class="mobile-tab active" id="mTab-devices"
+      onclick="switchTab('devices')" aria-label="Devices">
+      <span class="tab-icon">📡</span>
+      <span>Devices</span>
+    </button>
+    <button class="mobile-tab" id="mTab-dashboard"
+      onclick="switchTab('dashboard')" aria-label="Dashboard">
+      <span class="tab-icon">📊</span>
+      <span>Dashboard</span>
+    </button>
+    <button class="mobile-tab" id="mTab-log"
+      onclick="switchTab('log')" aria-label="Log">
+      <span class="tab-icon">📋</span>
+      <span>Log</span>
+      <span class="tab-badge" id="logBadge"></span>
+    </button>
+  </nav>
 </div>
 
 <script>
@@ -789,6 +923,7 @@ function handleEvent(evt) {
         updateConnectionState('connected', true);
         updateDeviceInfo(evt.data);
         updateMetricCard('mtu', evt.data.mtu, 'bytes');
+        _autoTab('dashboard');
       }
       break;
     case 'disconnect':
@@ -1093,6 +1228,7 @@ async function refreshStatus() {
 const MAX_LOG_ENTRIES = 500;
 
 function addLog(type, msg, _data) {
+  _bumpLogBadge();
   const log = document.getElementById('eventLog');
   const now = new Date();
   const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
@@ -1126,6 +1262,45 @@ function shortUuid(uuid) {
   if (m) return `0x${m[1].toUpperCase()}`;
   // Ninebot / custom – show first 8 chars
   return uuid.substring(0, 8) + '…';
+}
+
+// ── Mobile tab navigation ──────────────────────────────────────────────────
+const _TABS = {
+  devices:   'panelDevices',
+  dashboard: 'panelDashboard',
+  log:       'panelLog',
+};
+let _activeTab = 'devices';
+let _logUnread = 0;
+
+function switchTab(tab) {
+  Object.keys(_TABS).forEach(t => {
+    const panel = document.getElementById(_TABS[t]);
+    const btn   = document.getElementById('mTab-' + t);
+    const isActive = t === tab;
+    panel && panel.classList.toggle('tab-active', isActive);
+    btn   && btn.classList.toggle('active', isActive);
+  });
+  _activeTab = tab;
+  if (tab === 'log') {
+    _logUnread = 0;
+    const badge = document.getElementById('logBadge');
+    if (badge) { badge.textContent = ''; badge.classList.remove('visible'); }
+  }
+}
+
+function _bumpLogBadge() {
+  if (_activeTab === 'log') return;
+  _logUnread = Math.min(_logUnread + 1, 99);
+  const badge = document.getElementById('logBadge');
+  if (badge) { badge.textContent = String(_logUnread); badge.classList.add('visible'); }
+}
+
+/** Switch tab only on mobile and only if currently on a different tab. */
+function _autoTab(tab) {
+  if (window.matchMedia('(max-width: 900px)').matches && _activeTab !== tab) {
+    switchTab(tab);
+  }
 }
 
 // ── PWA – Service Worker registration ─────────────────────────────────────
@@ -1240,6 +1415,7 @@ class DashboardServer:
         app.router.add_get("/sw.js", self._handle_sw)
         app.router.add_get("/icon-192.png", self._handle_icon_192)
         app.router.add_get("/icon-512.png", self._handle_icon_512)
+        app.router.add_get("/offline.html", self._handle_offline)
         # Dashboard + SSE
         app.router.add_get("/", self._handle_index)
         app.router.add_get("/events", self._handle_sse)
@@ -1260,6 +1436,13 @@ class DashboardServer:
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
+
+    async def _handle_offline(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            text=_OFFLINE_HTML,
+            content_type="text/html",
+            charset="utf-8",
+        )
 
     async def _handle_manifest(self, _req: web.Request) -> web.Response:
         return web.Response(
