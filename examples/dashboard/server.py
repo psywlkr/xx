@@ -45,11 +45,14 @@ DASHBOARD_VERSION = "1.0"
 # ---------------------------------------------------------------------------
 
 _MANIFEST_JSON = json.dumps({
+    "id": "/",
     "name": "BLE Dashboard",
     "short_name": "BLE",
     "description": "BLE device scanner and controller powered by bleak",
     "start_url": "/",
+    "scope": "/",
     "display": "standalone",
+    "display_override": ["standalone", "minimal-ui"],
     "orientation": "any",
     "background_color": "#0a0e1a",
     "theme_color": "#0a0e1a",
@@ -60,13 +63,41 @@ _MANIFEST_JSON = json.dumps({
             "src": "/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any maskable",
+            "purpose": "any",
+        },
+        {
+            "src": "/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable",
         },
         {
             "src": "/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
-            "purpose": "any maskable",
+            "purpose": "any",
+        },
+        {
+            "src": "/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable",
+        },
+    ],
+    "screenshots": [
+        {
+            "src": "/screenshot-wide.png",
+            "sizes": "1280x800",
+            "type": "image/png",
+            "form_factor": "wide",
+            "label": "BLE Dashboard – full layout",
+        },
+        {
+            "src": "/screenshot-narrow.png",
+            "sizes": "390x844",
+            "type": "image/png",
+            "form_factor": "narrow",
+            "label": "BLE Dashboard – mobile layout",
         },
     ],
     "shortcuts": [
@@ -183,6 +214,46 @@ def _make_icon_png(size: int) -> bytes:
 _ICON_192 = _make_icon_png(192)
 _ICON_512 = _make_icon_png(512)
 
+
+_SCREENSHOT_HEADER_HEIGHT_PCT = 7  # header bar occupies the top 7% of the screenshot
+
+
+def _make_screenshot_png(width: int, height: int) -> bytes:
+    """
+    Generate a simple screenshot placeholder PNG for the PWA manifest.
+
+    Layout: accent-blue header bar (top _SCREENSHOT_HEADER_HEIGHT_PCT %) + dark-navy body.
+    Uses only the Python standard library.
+    """
+    import struct
+    import zlib
+
+    header_h = max(1, height * _SCREENSHOT_HEADER_HEIGHT_PCT // 100)
+    # Each row: 1 PNG filter byte (0 = None) + width * 3 RGB bytes
+    header_row = bytes([0]) + bytes([79, 142, 247] * width)   # #4f8ef7
+    body_row   = bytes([0]) + bytes([10,  14,  26] * width)   # #0a0e1a
+    raw = header_row * header_h + body_row * (height - header_h)
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">II", width, height) + bytes([8, 2, 0, 0, 0]))
+        + _chunk(b"IDAT", zlib.compress(raw, 1))
+        + _chunk(b"IEND", b"")
+    )
+
+
+# Pre-generate screenshots for the PWA manifest install dialog
+_SCREENSHOT_WIDE   = _make_screenshot_png(1280, 800)
+_SCREENSHOT_NARROW = _make_screenshot_png(390, 844)
+
 _OFFLINE_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -267,6 +338,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (display-mode: standalone) {
     .header { padding-top: env(safe-area-inset-top, 0px); }
     .app    { grid-template-rows: calc(56px + env(safe-area-inset-top, 0px)) 1fr; }
+    /* Already installed – no point showing the install button */
+    #btnInstall { display: none !important; }
   }
 
   /* ── Layout ─────────────────────────────── */
@@ -1321,12 +1394,15 @@ if ('serviceWorker' in navigator) {
 
 // ── PWA – Install prompt ───────────────────────────────────────────────────
 let _installPrompt = null;
+const _isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const _isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                   || window.navigator.standalone === true;
 
 window.addEventListener('beforeinstallprompt', (e) => {
   e.preventDefault();
   _installPrompt = e;
   const btn = document.getElementById('btnInstall');
-  if (btn) {
+  if (btn && !_isStandalone) {
     btn.style.display = '';
     addLog('state', 'App is installable – click "📲 Install App" to add to your home screen');
   }
@@ -1339,13 +1415,26 @@ window.addEventListener('appinstalled', () => {
   addLog('state', '✅ App installed successfully!');
 });
 
+// iOS Safari does not fire beforeinstallprompt – show the button manually
+if (_isIOS && !_isStandalone) {
+  window.addEventListener('load', () => {
+    const btn = document.getElementById('btnInstall');
+    if (btn) btn.style.display = '';
+  });
+}
+
 async function doInstall() {
-  if (!_installPrompt) return;
-  _installPrompt.prompt();
-  const { outcome } = await _installPrompt.userChoice;
-  addLog('state', `Install ${outcome === 'accepted' ? 'accepted ✅' : 'dismissed'}`);
-  _installPrompt = null;
-  document.getElementById('btnInstall').style.display = 'none';
+  if (_installPrompt) {
+    _installPrompt.prompt();
+    const { outcome } = await _installPrompt.userChoice;
+    addLog('state', `Install ${outcome === 'accepted' ? 'accepted ✅' : 'dismissed'}`);
+    _installPrompt = null;
+    document.getElementById('btnInstall').style.display = 'none';
+  } else if (_isIOS && !_isStandalone) {
+    // Show the step-by-step banner for iOS Safari users
+    const banner = document.getElementById('iosInstallBanner');
+    if (banner) banner.style.display = 'block';
+  }
 }
 
 // ── Handle URL shortcuts (e.g. ?action=scan) ─────────────────────────────
@@ -1362,6 +1451,25 @@ async function doInstall() {
 connectSSE();
 refreshStatus();
 </script>
+
+<!-- ── iOS PWA install instructions banner ──────────────────────────────── -->
+<div id="iosInstallBanner" role="dialog" aria-label="Install app"
+  style="display:none;position:fixed;bottom:0;left:0;right:0;z-index:9999;
+         background:#12172b;border-top:2px solid #4f8ef7;
+         padding:18px 20px 20px;text-align:center;font-size:14px;
+         box-shadow:0 -4px 24px rgba(0,0,0,.6);">
+  <button onclick="document.getElementById('iosInstallBanner').style.display='none'"
+    aria-label="Close"
+    style="position:absolute;top:10px;right:14px;background:none;border:none;
+           color:#64748b;font-size:20px;line-height:1;cursor:pointer;">×</button>
+  <div style="font-size:32px;margin-bottom:8px">📲</div>
+  <strong style="color:#4f8ef7;font-size:15px">Install BLE Dashboard</strong><br/>
+  <span style="color:#94a3b8;line-height:1.8">
+    Tap <strong style="color:#e2e8f0">Share</strong> (□↑)
+    → <strong style="color:#e2e8f0">Add to Home Screen</strong>
+    → <strong style="color:#e2e8f0">Add</strong>
+  </span>
+</div>
 </body>
 </html>"""
 
@@ -1415,6 +1523,8 @@ class DashboardServer:
         app.router.add_get("/sw.js", self._handle_sw)
         app.router.add_get("/icon-192.png", self._handle_icon_192)
         app.router.add_get("/icon-512.png", self._handle_icon_512)
+        app.router.add_get("/screenshot-wide.png", self._handle_screenshot_wide)
+        app.router.add_get("/screenshot-narrow.png", self._handle_screenshot_narrow)
         app.router.add_get("/offline.html", self._handle_offline)
         # Dashboard + SSE
         app.router.add_get("/", self._handle_index)
@@ -1469,6 +1579,20 @@ class DashboardServer:
     async def _handle_icon_512(self, _req: web.Request) -> web.Response:
         return web.Response(
             body=_ICON_512,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    async def _handle_screenshot_wide(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            body=_SCREENSHOT_WIDE,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    async def _handle_screenshot_narrow(self, _req: web.Request) -> web.Response:
+        return web.Response(
+            body=_SCREENSHOT_NARROW,
             content_type="image/png",
             headers={"Cache-Control": "public, max-age=86400"},
         )
